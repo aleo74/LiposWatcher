@@ -1,0 +1,53 @@
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Local databases, dumps and backups
+data/
+backups/
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+*.bak
+
+# Secrets and local certificates
+.secrets/
+secrets/
+*.secret
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs and crash output
+logs/
+*.log
+*.core
+core
+
+# Dependencies, build output and caches
+.venv/
+venv/
+node_modules/
+frontend/dist/
+frontend/.vite/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+frontend/tsconfig.tsbuildinfo
+
+# Temporary/editor files
+*.tmp
+*.temp
+*.swp
+*~
+.DS_Store
+Thumbs.db
