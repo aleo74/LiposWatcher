@@ -164,6 +164,27 @@ def test_atomic_batch_number_preview_snapshot_and_lot_removal(client):
     assert len(c.get('/api/batteries').json()) == 4
 
 
+def test_prefixed_battery_numbers_can_be_previewed_and_created(client):
+    c = client
+    login(c, 'alice')
+    m = model(c)
+    preview = c.post('/api/lots/preview', json={
+        'model_id': m['id'], 'quantity': 4, 'start_number': 'F750-001'
+    })
+    assert preview.status_code == 200, preview.text
+    assert preview.json()['numbers'] == ['F750-001', 'F750-002', 'F750-003', 'F750-004']
+    invalid = c.post('/api/lots/preview', json={
+        'model_id': m['id'], 'quantity': 2, 'start_number': 'F750'
+    })
+    assert invalid.status_code == 422
+    result = c.post('/api/lots/from-model', json={
+        'model_id': m['id'], 'numbers': preview.json()['numbers'],
+        'lot': {'name': 'Flywoo F750', 'condition': 'used'},
+    })
+    assert result.status_code == 201, result.text
+    assert [item['number'] for item in result.json()['batteries']] == preview.json()['numbers']
+
+
 def test_chargers_channels_archive_and_duplicate(client):
     c = client
     b = battery(c, prior_history='known', prior_cycles=29, notes='Notes historiques', charge_c=1, charge_rate_source='Notice')

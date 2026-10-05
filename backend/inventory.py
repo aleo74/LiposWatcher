@@ -1,5 +1,6 @@
 """Private inventory and moderated catalogue. Pack copies are immutable snapshots."""
 import json
+import re
 from datetime import date
 from typing import Literal
 
@@ -50,7 +51,15 @@ class ChargerInput(BaseModel):
 class PreviewInput(BaseModel):
     model_id: str
     quantity: int = Field(ge=1, le=100)
-    start_number: str = Field(default='001', pattern=r'^[0-9]{1,30}$')
+    start_number: str = Field(default='001', min_length=1, max_length=30)
+
+    @field_validator('start_number')
+    @classmethod
+    def clean_start_number(cls, value):
+        value = value.strip()
+        if not value or not (value.isdigit() or re.fullmatch(r'.*[-_.][0-9]+', value)):
+            raise ValueError('Utilisez un numéro seul ou un préfixe séparé du compteur par - _ ou .')
+        return value
 
 
 class CreateFromModel(BaseModel):
@@ -293,9 +302,13 @@ def register_inventory(app, get_user, BatteryInput, battery_for, now, uid, fail)
         with connect() as db:
             row, data = available_model(db, payload.model_id, user)
             taken = {r[0] for r in db.execute('SELECT number FROM batteries WHERE user_id=?', (user['id'],))}
-        numbers, n = [], int(payload.start_number)
+        match = re.fullmatch(r'(.*?)([0-9]+)', payload.start_number)
+        if not match:
+            fail(422, 'Le numéro de départ doit se terminer par un chiffre')
+        prefix, first_digits = match.groups()
+        numbers, n = [], int(first_digits)
         while len(numbers) < payload.quantity:
-            number = str(n).zfill(len(payload.start_number))
+            number = prefix + str(n).zfill(len(first_digits))
             if len(number) > 30:
                 fail(422, 'Suite de numéros trop longue')
             if number not in taken:
