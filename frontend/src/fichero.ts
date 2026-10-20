@@ -15,6 +15,20 @@ interface Device extends EventTarget {
 interface Bluetooth {requestDevice(options: unknown): Promise<Device>}
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
+// Notifications are unframed. A late stop acknowledgement is not a status byte.
+function statusByte(bytes: number[]): number | undefined {
+  let offset = 0
+  while (offset < bytes.length) {
+    if (bytes[offset] === 0xaa) {offset++; continue}
+    if (bytes[offset] === 0x4f) {
+      if (bytes[offset + 1] !== 0x4b) return undefined
+      offset += 2; continue
+    }
+    return bytes.length - offset === 1 && bytes[offset] < 0x80 ? bytes[offset] : undefined
+  }
+  return undefined
+}
+
 export function packRaster(rgba: Uint8ClampedArray, width: number, height: number): Uint8Array {
   if (width !== HEAD_WIDTH || height !== LABEL_ROWS || rgba.length !== width * height * 4) throw new Error('Format Fichero incorrect')
   const result = new Uint8Array(width * height / 8)
@@ -33,7 +47,7 @@ export class FicheroPrinter {
   private received: number[] = []
   private pending?: {accept: (bytes: number[]) => boolean; resolve: (bytes: number[]) => void; reject: (error: Error) => void}
   private printing = false
-  constructor(private changed: (connected: boolean) => void, private bluetooth?: Bluetooth) {}
+  constructor(private changed: (connected: boolean) => void, private bluetooth?: Bluetooth, private readyTimeoutMs = 30000) {}
   get connected() {return Boolean(this.device?.gatt.connected && this.write)}
   static supported() {return window.isSecureContext && 'bluetooth' in navigator}
   private disconnected = () => {
@@ -78,6 +92,23 @@ export class FicheroPrinter {
   private ack(bytes: number[], timeout = 5000) {
     return this.query(bytes, b => b.includes(0xaa) || new TextDecoder().decode(new Uint8Array(b)).includes('OK'), timeout)
   }
+  private async waitReady() {
+    const deadline = Date.now() + this.readyTimeoutMs
+    while (true) {
+      const response = await this.query([0x10, 0xff, 0x40], b => statusByte(b) !== undefined,
+        Math.min(5000, Math.max(1, deadline - Date.now())))
+      const status = statusByte(response)!
+      const faults: string[] = []
+      if (status & 0x02) faults.push('capot ouvert')
+      if (status & 0x04) faults.push('papier absent')
+      if (status & 0x08) faults.push('batterie faible')
+      if (status & 0x50) faults.push('surchauffe')
+      if (faults.length) throw new Error(`Erreur imprimante : ${faults.join(', ')} (état 0x${status.toString(16).padStart(2, '0')})`)
+      if (!(status & 0x01)) return // Charging alone (0x20) does not block printing.
+      if (Date.now() >= deadline) throw new Error('L’imprimante reste occupée. Série arrêtée sans renvoi de l’étiquette précédente.')
+      await pause(Math.min(200, Math.max(1, deadline - Date.now())))
+    }
+  }
   async connect() {
     const bluetooth = this.bluetooth || (navigator as Navigator & {bluetooth?: Bluetooth}).bluetooth
     if (!bluetooth) throw new Error('Bluetooth web indisponible : utilisez Chrome Android en HTTPS')
@@ -102,8 +133,8 @@ export class FicheroPrinter {
     if (raster.length !== HEAD_WIDTH * LABEL_ROWS / 8) throw new Error('Format Fichero incorrect')
     this.printing = true
     try {
-      const status = await this.query([0x10, 0xff, 0x40], b => b.length > 0)
-      if (status[0] & 0x5f) throw new Error('Imprimante occupée, capot ouvert, papier absent, batterie faible ou surchauffe')
+      // The previous stop ACK may precede motor/print-head readiness.
+      await this.waitReady()
       await this.ack([0x10, 0xff, 0x10, 0, 1])
       await pause(100)
       await this.ack([0x10, 0xff, 0x84, 0])

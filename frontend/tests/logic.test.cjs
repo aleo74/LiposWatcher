@@ -19,8 +19,9 @@ const {filterMeasurements,lastDeviceChoice} = load('sessionDevices.ts')
 const id = '11111111-2222-4333-8444-555555555555'
 const {FicheroPrinter, packRaster} = load('fichero.ts')
 
-function fakePrinter({paperError = false, disconnectDuringRaster = false, endError = false} = {}) {
+function fakePrinter({paperError = false, disconnectDuringRaster = false, endError = false, statuses = [0], lateStatusAck = false, disconnectOnBusy = false} = {}) {
   const notifications = new EventTarget(), device = new EventTarget(), sent = []
+  let statusIndex = 0
   device.gatt = {
     connected: false,
     async connect() {this.connected = true; return {getPrimaryService: async () => ({getCharacteristic: async uuid => uuid.includes('2af1') ? writer : notifications})}},
@@ -32,7 +33,12 @@ function fakePrinter({paperError = false, disconnectDuringRaster = false, endErr
     sent.push([...bytes])
     const key = [...bytes].join(',')
     if (key === '16,255,32,240') {queueMicrotask(() => {emit([68,49]); emit([49,115])})}
-    else if (key === '16,255,64') queueMicrotask(() => emit([paperError ? 4 : 0]))
+    else if (key === '16,255,64') queueMicrotask(() => {
+      const status = paperError ? 4 : statuses[Math.min(statusIndex++, statuses.length - 1)]
+      if (disconnectOnBusy && (status & 1)) {device.gatt.disconnect(); return}
+      if (lateStatusAck) {emit([0xaa]); emit([79]); emit([75])}
+      emit([status])
+    })
     else if (key === '16,255,254,69' && endError) queueMicrotask(() => emit([255, 2]))
     else if (key.startsWith('16,255,16,') || key === '16,255,132,0' || key === '16,255,254,69') queueMicrotask(() => {emit([79]); emit([75])})
     else if (bytes[0] === 29 && bytes[1] === 118 && disconnectDuringRaster) device.gatt.disconnect()
@@ -74,6 +80,44 @@ test('Fichero rejects paper errors and disconnections without retrying the label
     await printer.connect()
     await assert.rejects(printer.print(new Uint8Array(2880)))
     assert.ok(fake.sent.filter(b => b[0] === 29 && b[1] === 118).length <= 1)
+    printer.disconnect()
+  }
+})
+
+test('Fichero batch waits for readiness after the first label and ignores late ACKs', async () => {
+  const fake = fakePrinter({statuses: [0, 1, 1, 0], lateStatusAck: true})
+  const printer = new FicheroPrinter(() => {}, fake.bluetooth)
+  await printer.connect()
+  await printer.print(new Uint8Array(2880))
+  const afterFirst = fake.sent.length
+  await printer.print(new Uint8Array(2880))
+  assert.deepEqual(fake.sent.slice(afterFirst, afterFirst + 3), Array.from({length: 3}, () => [16, 255, 64]))
+  assert.equal(fake.sent.filter(b => b[0] === 29 && b[1] === 118).length, 2)
+  assert.equal(fake.sent.filter(b => b.join(',') === '29,12').length, 2)
+  assert.equal(fake.sent.filter(b => b.join(',') === '16,255,254,69').length, 2)
+  printer.disconnect()
+})
+
+test('Fichero distinguishes busy from actual faults, including faults while busy', async () => {
+  for (const [status, message] of [[3, /capot ouvert/], [5, /papier absent/], [9, /batterie faible/], [17, /surchauffe/], [65, /surchauffe/]]) {
+    const fake = fakePrinter({statuses: [status]})
+    const printer = new FicheroPrinter(() => {}, fake.bluetooth)
+    await printer.connect()
+    await assert.rejects(printer.print(new Uint8Array(2880)), message)
+    assert.equal(fake.sent.filter(b => b[0] === 29 && b[1] === 118).length, 0)
+    printer.disconnect()
+  }
+})
+
+test('Fichero stops on a permanent busy state or a between-label disconnection without duplicates', async () => {
+  for (const disconnectOnBusy of [false, true]) {
+    const fake = fakePrinter({statuses: [0, 1], disconnectOnBusy})
+    const printer = new FicheroPrinter(() => {}, fake.bluetooth, 20)
+    await printer.connect()
+    await printer.print(new Uint8Array(2880))
+    await assert.rejects(printer.print(new Uint8Array(2880)), disconnectOnBusy ? /déconnecté/ : /reste occupée/)
+    assert.equal(fake.sent.filter(b => b[0] === 29 && b[1] === 118).length, 1)
+    assert.equal(fake.sent.filter(b => b.join(',') === '29,12').length, 1)
     printer.disconnect()
   }
 })
