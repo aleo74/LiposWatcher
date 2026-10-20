@@ -359,8 +359,46 @@ def create_user(payload: Credentials, user=Depends(get_user)):
 @app.get("/api/batteries")
 def batteries(q: str = "", status: str = "", user=Depends(get_user)):
     with connect() as db:
-        rows = db.execute("SELECT b.*, (SELECT COUNT(*) FROM entries e WHERE e.battery_id=b.id AND e.kind='charge') AS charge_count FROM batteries b WHERE b.user_id=? AND b.number ILIKE ? AND (?='' OR b.status=?) ORDER BY b.number", (user["id"], f"%{q}%", status, status)).fetchall()
+        rows = db.execute("""SELECT b.*, stats.charge_count, stats.last_used_at, stats.last_measured_at,
+            stats.last_activity_at FROM batteries b LEFT JOIN LATERAL (
+              SELECT COUNT(*) FILTER (WHERE e.kind='charge') AS charge_count,
+                MAX(e.occurred_at::timestamptz) FILTER (WHERE e.kind='flight') AS last_used_at,
+                MAX(e.occurred_at::timestamptz) AS last_activity_at,
+                MAX(e.occurred_at::timestamptz) FILTER (WHERE e.discharged_mah IS NOT NULL OR EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(
+                    COALESCE(e.before_v,'[]')::jsonb || COALESCE(e.after_v,'[]')::jsonb ||
+                    COALESCE(e.resistance_mohm,'[]')::jsonb) AS v WHERE v <> 'null'::jsonb
+                )) AS last_measured_at
+              FROM entries e WHERE e.battery_id=b.id
+            ) stats ON true
+            WHERE b.user_id=? AND b.number ILIKE ? AND (?='' OR b.status=?) ORDER BY b.number""",
+            (user["id"], f"%{q}%", status, status)).fetchall()
     return [dict(r) for r in rows]
+
+
+class CompareBatteries(BaseModel):
+    battery_ids: list[str] = Field(min_length=2, max_length=20)
+
+
+@app.post('/api/batteries/compare')
+def compare_batteries(payload: CompareBatteries, user=Depends(get_user)):
+    ids = list(dict.fromkeys(payload.battery_ids))
+    if len(ids) < 2:
+        fail(422, 'Sélectionnez au moins deux batteries distinctes')
+    with connect() as db:
+        # Same ownership snapshot for all batteries and their historical measures.
+        db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
+        rows = db.execute(f"SELECT * FROM batteries WHERE user_id=? AND id IN ({','.join('?' for _ in ids)}) ORDER BY number",
+                          (user['id'], *ids)).fetchall()
+        if len(rows) != len(ids):
+            fail()
+        result = []
+        for row in rows:
+            battery = dict(row)
+            battery['entries'] = [decode_entry(e, battery['nominal_mah']) for e in db.execute(
+                'SELECT * FROM entries WHERE battery_id=? ORDER BY occurred_at DESC', (battery['id'],))]
+            result.append(battery)
+    return {'batteries': result}
 
 
 @app.post("/api/batteries", status_code=201)
@@ -580,7 +618,7 @@ def csv_safe(value):
 
 from .accounts import register_accounts
 from .transfers import register_transfers
-register_accounts(app, get_user, hasher, now, uid, SECURE_COOKIE, fail)
+register_accounts(app, get_user, hasher, now, uid, SECURE_COOKIE, fail, set_cookie)
 register_transfers(app, get_user, battery_for, now, uid, fail)
 
 

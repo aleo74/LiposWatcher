@@ -47,8 +47,10 @@ export class FicheroPrinter {
   private received: number[] = []
   private pending?: {accept: (bytes: number[]) => boolean; resolve: (bytes: number[]) => void; reject: (error: Error) => void}
   private printing = false
+  private generation = 0
   constructor(private changed: (connected: boolean) => void, private bluetooth?: Bluetooth, private readyTimeoutMs = 30000) {}
   get connected() {return Boolean(this.device?.gatt.connected && this.write)}
+  get name() {return this.device?.name || 'Fichero D11s'}
   static supported() {return window.isSecureContext && 'bluetooth' in navigator}
   private disconnected = () => {
     this.pending?.reject(new Error('Bluetooth déconnecté ; impression éventuellement partielle. Vérifiez les étiquettes avant de recommencer.'))
@@ -57,7 +59,9 @@ export class FicheroPrinter {
     this.changed(false)
   }
   disconnect() {
+    this.generation++
     this.notify?.removeEventListener('characteristicvaluechanged', this.onNotify)
+    this.device?.removeEventListener('gattserverdisconnected', this.disconnected)
     this.device?.gatt.disconnect()
     this.disconnected()
   }
@@ -81,12 +85,14 @@ export class FicheroPrinter {
   private async query(bytes: number[], accept: (bytes: number[]) => boolean, timeout = 5000) {
     this.received = []
     let timer: ReturnType<typeof setTimeout> | undefined
+    let rejectResponse: (error: Error) => void = () => {}
     const response = new Promise<number[]>((resolve, reject) => {
+      rejectResponse = reject
       this.pending = {accept, resolve, reject}
       timer = setTimeout(() => reject(new Error('Aucune confirmation de l’imprimante. Impression incertaine : vérifiez avant de recommencer.')), timeout)
     })
     // Attach the rejection handler before the write, including immediate failures.
-    const writing = this.send(bytes).catch(error => {this.pending?.reject(error)})
+    const writing = this.send(bytes).catch(error => {rejectResponse(error)})
     try {const [, result] = await Promise.all([writing, response]); return result} finally {clearTimeout(timer); this.pending = undefined}
   }
   private ack(bytes: number[], timeout = 5000) {
@@ -109,20 +115,26 @@ export class FicheroPrinter {
       await pause(Math.min(200, Math.max(1, deadline - Date.now())))
     }
   }
-  async connect() {
+  async connect(reselect = false) {
+    if (this.connected && !reselect) return
     const bluetooth = this.bluetooth || (navigator as Navigator & {bluetooth?: Bluetooth}).bluetooth
     if (!bluetooth) throw new Error('Bluetooth web indisponible : utilisez Chrome Android en HTTPS')
+    const remembered = reselect ? undefined : this.device
     this.disconnect()
-    const device = await bluetooth.requestDevice({filters: [{namePrefix: 'FICHERO'}, {namePrefix: 'D11s_'}], optionalServices: [SERVICE]})
+    const generation = this.generation
+    const device = remembered || await bluetooth.requestDevice({filters: [{namePrefix: 'FICHERO'}, {namePrefix: 'D11s_'}], optionalServices: [SERVICE]})
+    if (generation !== this.generation) throw new Error('Connexion annulée')
     this.device = device
     device.addEventListener('gattserverdisconnected', this.disconnected)
     try {
       const server = await device.gatt.connect()
+      if (generation !== this.generation) {device.gatt.disconnect(); throw new Error('Connexion annulée')}
       const service = await server.getPrimaryService(SERVICE)
       this.write = await service.getCharacteristic('00002af1-0000-1000-8000-00805f9b34fb')
       this.notify = await service.getCharacteristic('00002af0-0000-1000-8000-00805f9b34fb')
       this.notify.addEventListener('characteristicvaluechanged', this.onNotify)
       await this.notify.startNotifications()
+      if (generation !== this.generation) throw new Error('Connexion annulée')
       const model = await this.query([0x10, 0xff, 0x20, 0xf0], b => new TextDecoder().decode(new Uint8Array(b)).includes('D11s'))
       if (!new TextDecoder().decode(new Uint8Array(model)).includes('D11s')) throw new Error('Modèle Fichero non compatible')
       this.changed(true)

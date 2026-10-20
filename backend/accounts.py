@@ -69,7 +69,12 @@ class Reset(TokenInput):
     password: str = Field(min_length=12, max_length=256)
 
 
-def register_accounts(app, get_user, hasher, now, uid, secure_cookie, fail):
+class ChangePassword(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    password: str = Field(min_length=12, max_length=256)
+
+
+def register_accounts(app, get_user, hasher, now, uid, secure_cookie, fail, set_cookie):
     def issue(db, user_id, email, purpose, tasks):
         db.execute('SELECT id FROM users WHERE id=? FOR UPDATE', (user_id,)).fetchone()
         token = secrets.token_urlsafe(48)
@@ -185,3 +190,20 @@ def register_accounts(app, get_user, hasher, now, uid, secure_cookie, fail):
             db.execute('UPDATE auth_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL', (now(), row['user_id']))
             db.execute('DELETE FROM login_sessions WHERE user_id=?', (row['user_id'],))
         return {'message': 'Mot de passe remplacé. Reconnectez-vous.'}
+
+    @app.post('/api/auth/change-password')
+    def change_password(payload: ChangePassword, request: Request, response: Response, user=Depends(get_user)):
+        rate_limit(request, 'password-change', user['id'], maximum=5)
+        with connect() as db:
+            row = db.execute('SELECT password_hash FROM users WHERE id=? FOR UPDATE', (user['id'],)).fetchone()
+            try:
+                valid = row is not None and hasher.verify(row['password_hash'], payload.current_password)
+            except VerificationError:
+                valid = False
+            if not valid:
+                fail(403, 'Mot de passe actuel incorrect')
+            db.execute('UPDATE users SET password_hash=? WHERE id=?', (hasher.hash(payload.password), user['id']))
+            db.execute('UPDATE auth_tokens SET used_at=? WHERE user_id=? AND used_at IS NULL', (now(), user['id']))
+            db.execute('DELETE FROM login_sessions WHERE user_id=?', (user['id'],))
+            set_cookie(response, user['id'], db)
+        return {'message': 'Mot de passe modifié. Les autres sessions et les anciens liens de récupération ont été invalidés.'}

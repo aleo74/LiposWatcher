@@ -2,6 +2,7 @@
 import React from 'react'
 import {createRoot} from 'react-dom/client'
 import {Labels} from '../src/Labels'
+import {PrinterProvider} from '../src/PrinterContext'
 import type {Battery} from '../src/api'
 import '../src/style.css'
 
@@ -15,4 +16,4 @@ window.fetch = async (input, init) => {
   return originalFetch(input, init)
 }
 localStorage.setItem('lipowatcher:printer', 'fichero')
-createRoot(document.getElementById('root')!).render(<main className="container"><p className="notice">Recette visuelle — données et API simulées. Aucun compte réel.</p><Labels list={[battery]} go={() => {}}/></main>)
+createRoot(document.getElementById('root')!).render(<PrinterProvider userId="visual-fixture"><main className="container"><p className="notice">Recette visuelle — données et API simulées. Aucun compte réel.</p><Labels list={[battery]} go={() => {}}/></main></PrinterProvider>)

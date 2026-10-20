@@ -18,13 +18,31 @@ const {ampsFromMahAndC} = load('chargeMath.ts')
 const {filterMeasurements,lastDeviceChoice} = load('sessionDevices.ts')
 const id = '11111111-2222-4333-8444-555555555555'
 const {FicheroPrinter, packRaster} = load('fichero.ts')
+const {PrintQueue} = load('printQueue.ts')
+const {sortFleet, modelKey, latestMeasured} = load('fleetUtils.ts')
+const {thermalTextLayout} = load('thermalLabel.ts')
+
+test('thermal labels preserve identifiers, readable sizes and bounded layout', () => {
+  const measure = (text, font) => [...text].length * Number(font.match(/(\d+)px/)[1]) * .6
+  for (const number of ['FW750-005', '001', 'abc-Été-01', 'A'.repeat(30)]) {
+    const result = thermalTextLayout(number, 16, 100000, measure)
+    assert.equal(result.lines.join(''), number)
+    assert.ok(result.size >= 20)
+    assert.ok(result.detailSize >= 16)
+    assert.ok(result.top >= 0)
+    assert.ok(result.top + result.lines.length * result.lineHeight + result.gap + result.detailSize + 2 <= 96)
+    for (const line of result.lines) assert.ok(measure(line, `900 ${result.size}px Arial`) <= 142)
+  }
+  assert.throws(() => thermalTextLayout('W'.repeat(100), 2, 750, measure), /trop long/)
+})
 
 function fakePrinter({paperError = false, disconnectDuringRaster = false, endError = false, statuses = [0], lateStatusAck = false, disconnectOnBusy = false} = {}) {
   const notifications = new EventTarget(), device = new EventTarget(), sent = []
   let statusIndex = 0
+  const counts = {requests: 0, connections: 0}
   device.gatt = {
     connected: false,
-    async connect() {this.connected = true; return {getPrimaryService: async () => ({getCharacteristic: async uuid => uuid.includes('2af1') ? writer : notifications})}},
+    async connect() {counts.connections++; this.connected = true; return {getPrimaryService: async () => ({getCharacteristic: async uuid => uuid.includes('2af1') ? writer : notifications})}},
     disconnect() {this.connected = false; device.dispatchEvent(new Event('gattserverdisconnected'))},
   }
   function emit(bytes) {notifications.value = new DataView(Uint8Array.from(bytes).buffer); notifications.dispatchEvent(new Event('characteristicvaluechanged'))}
@@ -43,8 +61,92 @@ function fakePrinter({paperError = false, disconnectDuringRaster = false, endErr
     else if (key.startsWith('16,255,16,') || key === '16,255,132,0' || key === '16,255,254,69') queueMicrotask(() => {emit([79]); emit([75])})
     else if (bytes[0] === 29 && bytes[1] === 118 && disconnectDuringRaster) device.gatt.disconnect()
   }}
-  return {sent, device, bluetooth: {requestDevice: async () => device}}
+  return {sent, device, counts, bluetooth: {requestDevice: async () => {counts.requests++; return device}}}
 }
+
+test('Fichero reuses an active connection and reconnects the known device without another chooser', async () => {
+  const fake = fakePrinter()
+  const printer = new FicheroPrinter(() => {}, fake.bluetooth)
+  await printer.connect(); await printer.connect()
+  assert.deepEqual(fake.counts, {requests: 1, connections: 1})
+  fake.device.gatt.disconnect()
+  assert.equal(printer.connected, false)
+  await printer.connect()
+  assert.equal(printer.connected, true)
+  assert.deepEqual(fake.counts, {requests: 1, connections: 2})
+  await printer.connect(true)
+  assert.deepEqual(fake.counts, {requests: 2, connections: 3})
+  printer.disconnect()
+})
+
+test('Fichero discards a chooser response arriving after logout/disposal', async () => {
+  const fake = fakePrinter()
+  let selected
+  const printer = new FicheroPrinter(() => {}, {requestDevice: () => new Promise(resolve => {selected = resolve})})
+  const connecting = printer.connect()
+  printer.disconnect()
+  selected(fake.device)
+  await assert.rejects(connecting, /annulée/)
+  assert.equal(fake.device.gatt.connected, false)
+})
+
+test('print queue requires review after an uncertain label and resumes only remaining copies', async () => {
+  const queue = new PrintQueue('alice')
+  queue.enqueue([{id, number: 'F750-001', copies: 3}], 'compact')
+  let sent = 0
+  const prepare = async () => new Uint8Array(2880)
+  await assert.rejects(queue.run(prepare, async () => {if (++sent === 2) throw new Error('Link lost after send')}))
+  assert.deepEqual(queue.snapshot().map(j => j.state), ['confirmed', 'uncertain', 'queued'])
+  await assert.rejects(queue.run(prepare, async () => {sent++}), /Vérifiez/)
+  assert.equal(sent, 2)
+  queue.resolve(queue.snapshot()[1].id, 'confirmed')
+  await queue.run(prepare, async () => {sent++})
+  assert.equal(sent, 3)
+  assert.deepEqual(queue.snapshot().map(j => j.state), ['confirmed', 'confirmed', 'confirmed'])
+})
+
+test('print queue handles permission/preparation failure before sending, isolates users, and recovers interrupted states', async () => {
+  const values = new Map()
+  const storage = {getItem: key => values.get(key) || null, setItem: (key, value) => values.set(key, value)}
+  const queue = new PrintQueue('alice', storage)
+  queue.enqueue([{id, number: '001', copies: 1}], 'link')
+  await assert.rejects(queue.run(async () => {throw new Error('404')}, async () => assert.fail('must not print inaccessible battery')))
+  assert.equal(queue.snapshot()[0].state, 'failed')
+  assert.equal(new PrintQueue('bob', storage).snapshot().length, 0)
+  values.set('lipowatcher:print-queue:v1:bob', values.get('lipowatcher:print-queue:v1:alice'))
+  assert.equal(new PrintQueue('bob', storage).snapshot().length, 0)
+  const saved = JSON.parse(values.get('lipowatcher:print-queue:v1:alice'))
+  saved.jobs[0].state = 'printing'
+  values.set('lipowatcher:print-queue:v1:alice', JSON.stringify(saved))
+  assert.equal(new PrintQueue('alice', storage).snapshot()[0].state, 'uncertain')
+  saved.jobs[0].state = 'preparing'
+  values.set('lipowatcher:print-queue:v1:alice', JSON.stringify(saved))
+  assert.equal(new PrintQueue('alice', storage).snapshot()[0].state, 'queued')
+})
+
+test('print queue prevents overlapping runs and pauses without duplicating a confirmed copy', async () => {
+  const queue = new PrintQueue('alice')
+  queue.enqueue([{id, number: '001', copies: 2}], 'compact')
+  let finish
+  const running = queue.run(async () => new Uint8Array(2880), () => new Promise(resolve => {finish = resolve}))
+  await new Promise(resolve => setImmediate(resolve))
+  await assert.rejects(queue.run(async () => new Uint8Array(2880), async () => {}), /déjà/)
+  queue.pause(); finish(); await running
+  assert.deepEqual(queue.snapshot().map(j => j.state), ['confirmed', 'queued'])
+  assert.throws(() => queue.enqueue([{id, number: '001', copies: 21}], 'link'))
+})
+
+test('fleet sorting leaves missing dates last, groups snapshots, and distinguishes measured data', () => {
+  const common = {brand: 'Flywoo', model: '750', chemistry: 'LiPo', cells: 2, nominal_mah: 750}
+  const list = [{...common, number: 'F750-10'}, {...common, number: 'F750-2', last_used_at: '2026-10-18'}, {...common, number: 'F750-1', last_used_at: '2026-10-20'}]
+  assert.deepEqual(sortFleet(list, 'number').map(b => b.number), ['F750-1', 'F750-2', 'F750-10'])
+  assert.deepEqual(sortFleet(list, 'last_used_at').map(b => b.number), ['F750-1', 'F750-2', 'F750-10'])
+  assert.equal(modelKey(common), modelKey({...common, brand: ' FLYWOO '}))
+  assert.notEqual(modelKey(common), modelKey({...common, nominal_mah: 850}))
+  const entries = [{kind: 'baseline', occurred_at: '2026-10-20', resistance_mohm: [null, null]}, {kind: 'test', occurred_at: '2026-10-19', discharged_mah: 700, resistance_mohm: [null, 7]}]
+  assert.equal(latestMeasured(entries, 'capacity'), entries[1])
+  assert.equal(latestMeasured(entries, 'resistance'), entries[1])
+})
 
 test('Fichero raster uses 96 x 240 dots, MSB-first, no transparent black', () => {
   const rgba = new Uint8ClampedArray(96 * 240 * 4).fill(255)
