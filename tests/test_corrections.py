@@ -26,6 +26,58 @@ def create_battery(client, **extra):
     return result.json()["id"]
 
 
+def test_fichero_qr_size_link_and_owner_isolation(client, monkeypatch):
+    from PIL import Image
+    import qrcode
+    create_account(client)
+    battery_id = create_battery(client, number='F750-003')
+    monkeypatch.setenv('PUBLIC_URL', 'https://liposwatcher.aldgram-solutions.fr')
+    response = client.get(f'/api/batteries/{battery_id}/qr.png?profile=fichero')
+    assert response.status_code == 200
+    actual = Image.open(io.BytesIO(response.content)).convert('RGB')
+    expected = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=2, border=4)
+    expected.add_data(f'https://liposwatcher.aldgram-solutions.fr/b/{battery_id}')
+    expected.make(fit=True)
+    assert actual.size[0] <= 96 and actual.size[0] == actual.size[1]
+    assert actual.tobytes() == expected.make_image().convert('RGB').tobytes()
+    # Quiet zone remains white, four modules of two dots each.
+    assert set(actual.crop((0, 0, actual.width, 8)).tobytes()) == {255}
+    monkeypatch.setenv('PUBLIC_URL', 'https://' + 'long-domain.' * 20 + 'example.com')
+    assert client.get(f'/api/batteries/{battery_id}/qr.png?profile=fichero').status_code == 422
+    # Standard QR does not depend on the public address or compact profile.
+    assert client.get(f'/api/batteries/{battery_id}/qr.png').status_code == 200
+    assert client.post('/api/users', json={'username': 'other', 'password': 'other_password_123'}).status_code == 201
+    client.post('/api/auth/logout')
+    client.post('/api/auth/login', json={'username': 'other', 'password': 'other_password_123'})
+    assert client.get(f'/api/batteries/{battery_id}/qr.png?profile=fichero').status_code == 404
+    client.post('/api/auth/logout')
+    assert client.get(f'/api/batteries/{battery_id}/qr.png?profile=fichero').status_code == 401
+
+
+def test_fichero_compact_qr_has_larger_modules_and_same_private_identifier(client, monkeypatch):
+    from PIL import Image
+    from backend.qr import compact_payload, compact_qr
+    assert compact_payload('11111111-2222-4333-8444-555555555555') == 'L4724728E4DM8KWGKZAKZAKZA'
+    assert compact_payload('ffffffff-ffff-ffff-ffff-ffffffffffff') == 'L' + 'FGW' * 8
+    create_account(client)
+    battery_id = create_battery(client)
+    monkeypatch.delenv('PUBLIC_URL', raising=False)
+    endpoint = f'/api/batteries/{battery_id}/qr.png?profile=fichero&content=compact'
+    response = client.get(endpoint)
+    assert response.status_code == 200
+    actual = Image.open(io.BytesIO(response.content)).convert('RGB')
+    assert actual.size == (87, 87)  # (21 modules + 2 * 4 quiet modules) * 3 dots
+    assert actual.tobytes() == compact_qr(battery_id).convert('RGB').tobytes()
+    assert set(actual.crop((0, 0, 87, 12)).tobytes()) == {255}
+    assert 'no-store' in response.headers['cache-control']
+    client.post('/api/users', json={'username': 'other', 'password': 'other_password_123'})
+    client.post('/api/auth/logout')
+    client.post('/api/auth/login', json={'username': 'other', 'password': 'other_password_123'})
+    assert client.get(endpoint).status_code == 404
+    client.post('/api/auth/logout')
+    assert client.get(endpoint).status_code == 401
+
+
 def test_login_limit_and_expired_session(client, monkeypatch):
     create_account(client)
     monkeypatch.setattr(app_module, "LOGIN_MAX_ATTEMPTS", 3)

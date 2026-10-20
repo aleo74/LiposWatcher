@@ -17,6 +17,66 @@ const {draftKey, loadDraft, saveDraft, clearDraft} = load('drafts.ts')
 const {ampsFromMahAndC} = load('chargeMath.ts')
 const {filterMeasurements,lastDeviceChoice} = load('sessionDevices.ts')
 const id = '11111111-2222-4333-8444-555555555555'
+const {FicheroPrinter, packRaster} = load('fichero.ts')
+
+function fakePrinter({paperError = false, disconnectDuringRaster = false, endError = false} = {}) {
+  const notifications = new EventTarget(), device = new EventTarget(), sent = []
+  device.gatt = {
+    connected: false,
+    async connect() {this.connected = true; return {getPrimaryService: async () => ({getCharacteristic: async uuid => uuid.includes('2af1') ? writer : notifications})}},
+    disconnect() {this.connected = false; device.dispatchEvent(new Event('gattserverdisconnected'))},
+  }
+  function emit(bytes) {notifications.value = new DataView(Uint8Array.from(bytes).buffer); notifications.dispatchEvent(new Event('characteristicvaluechanged'))}
+  notifications.startNotifications = async () => {}
+  const writer = {async writeValueWithoutResponse(bytes) {
+    sent.push([...bytes])
+    const key = [...bytes].join(',')
+    if (key === '16,255,32,240') {queueMicrotask(() => {emit([68,49]); emit([49,115])})}
+    else if (key === '16,255,64') queueMicrotask(() => emit([paperError ? 4 : 0]))
+    else if (key === '16,255,254,69' && endError) queueMicrotask(() => emit([255, 2]))
+    else if (key.startsWith('16,255,16,') || key === '16,255,132,0' || key === '16,255,254,69') queueMicrotask(() => {emit([79]); emit([75])})
+    else if (bytes[0] === 29 && bytes[1] === 118 && disconnectDuringRaster) device.gatt.disconnect()
+  }}
+  return {sent, device, bluetooth: {requestDevice: async () => device}}
+}
+
+test('Fichero raster uses 96 x 240 dots, MSB-first, no transparent black', () => {
+  const rgba = new Uint8ClampedArray(96 * 240 * 4).fill(255)
+  rgba[0] = rgba[1] = rgba[2] = 0
+  rgba[7 * 4] = rgba[7 * 4 + 1] = rgba[7 * 4 + 2] = 0
+  rgba[8 * 4] = rgba[8 * 4 + 1] = rgba[8 * 4 + 2] = 0
+  rgba[8 * 4 + 3] = 0
+  const raster = packRaster(rgba, 96, 240)
+  assert.equal(raster.length, 2880)
+  assert.equal(raster[0], 129)
+  assert.equal(raster[1], 0)
+  assert.throws(() => packRaster(rgba, 112, 240))
+})
+
+test('Fichero sends the D11s sequence and waits for fragmented acknowledgements', async () => {
+  const fake = fakePrinter()
+  const printer = new FicheroPrinter(() => {}, fake.bluetooth)
+  await printer.connect()
+  await printer.print(new Uint8Array(2880))
+  const raster = fake.sent.filter(b => b.length > 12).flat()
+  assert.equal(raster.length, 2888)
+  assert.deepEqual(raster.slice(0, 8), [29, 118, 48, 0, 12, 0, 240, 0])
+  assert.ok(fake.sent.every(b => b.length <= 200))
+  assert.deepEqual(fake.sent.at(-2), [29, 12])
+  assert.deepEqual(fake.sent.at(-1), [16, 255, 254, 69])
+  printer.disconnect()
+})
+
+test('Fichero rejects paper errors and disconnections without retrying the label', async () => {
+  for (const options of [{paperError: true}, {disconnectDuringRaster: true}, {endError: true}]) {
+    const fake = fakePrinter(options)
+    const printer = new FicheroPrinter(() => {}, fake.bluetooth)
+    await printer.connect()
+    await assert.rejects(printer.print(new Uint8Array(2880)))
+    assert.ok(fake.sent.filter(b => b[0] === 29 && b[1] === 118).length <= 1)
+    printer.disconnect()
+  }
+})
 
 test('versioned and legacy QR yield only a UUID', () => {
   assert.equal(parseQrIdentifier(`lipowatcher:v1:${id}`), id)
@@ -26,6 +86,15 @@ test('versioned and legacy QR yield only a UUID', () => {
   assert.equal(parseQrIdentifier('javascript:alert(1)'), null)
   assert.equal(parseQrIdentifier('lipowatcher:v2:' + id), null)
   assert.equal(parseQrIdentifier('https://old.example/b/../../admin'), null)
+})
+
+test('compact version-L QR yields the same UUID and rejects malformed Base45', () => {
+  assert.equal(parseQrIdentifier('L4724728E4DM8KWGKZAKZAKZA'), id)
+  assert.equal(parseQrIdentifier('L' + '000'.repeat(8)), '00000000-0000-0000-0000-000000000000')
+  assert.equal(parseQrIdentifier('L' + 'FGW'.repeat(8)), 'ffffffff-ffff-ffff-ffff-ffffffffffff')
+  assert.equal(parseQrIdentifier('L' + ':::'.repeat(8)), null)
+  assert.equal(parseQrIdentifier('L' + 'abc'.repeat(8)), null)
+  assert.equal(parseQrIdentifier('L4724728E4DM8KWGKZAKZAKZ'), null)
 })
 
 test('drafts are isolated by user, battery and entry', () => {

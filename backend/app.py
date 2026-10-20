@@ -521,10 +521,29 @@ def delete_entry(battery_id: str, entry_id: str, user=Depends(get_user)):
 
 
 @app.get("/api/batteries/{battery_id}/qr.png")
-def battery_qr(battery_id: str, user=Depends(get_user)):
+def battery_qr(battery_id: str, request: Request, profile: Literal['standard', 'fichero'] = 'standard', content: Literal['link', 'compact'] = 'link', user=Depends(get_user)):
     with connect() as db:
         battery_for(db, user["id"], battery_id)
-    image = qrcode.make(f"lipowatcher:v1:{battery_id}")
+    if profile == 'fichero' and content == 'compact':
+        from .qr import compact_qr
+        image = compact_qr(battery_id)
+    elif profile == 'fichero':
+        # 96-dot head: integer modules and the full four-module quiet zone.
+        origin = os.environ.get('PUBLIC_URL', '').rstrip('/')
+        if not origin and os.environ.get('APP_ENV') in ('local', 'test'):
+            origin = str(request.base_url).rstrip('/')
+        from urllib.parse import urlsplit
+        parsed = urlsplit(origin)
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.path or parsed.query or parsed.fragment or parsed.username:
+            fail(422, 'Configurer PUBLIC_URL avec l’origine publique de LipoWatcher')
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=2, border=4)
+        qr.add_data(f'{origin}/b/{battery_id}')
+        qr.make(fit=True)
+        if len(qr.get_matrix()) * 2 > 96:
+            fail(422, 'Adresse publique trop longue pour un QR Fichero lisible : utiliser un domaine plus court')
+        image = qr.make_image()
+    else:
+        image = qrcode.make(f"lipowatcher:v1:{battery_id}")
     output = io.BytesIO()
     image.save(output, format="PNG")
     output.seek(0)
